@@ -212,4 +212,13 @@ agent_communication:
         5. Book → 6. Auto-accepted → 7. Start OTP → 8. Verify Start →
         9. End OTP → 10. Complete → +25 Karma awarded.
       Fixed Next.js 15 hydration blank-screen (Framer Motion + allowedDevOrigins).
-      Awaiting user confirmation before invoking frontend testing.
+  - agent: "main"
+    message: |
+      Feature addition: In-app real-time chat (polling 1.2s) + notification bell + feed.
+      Backend endpoints:
+        - GET/POST /api/bookings/:id/messages
+        - GET /api/notifications, POST /api/notifications/:id/read, POST /api/notifications/read-all
+      Auto notifications on: booking created, accepted, rejected, started, completed, karma award, new chat message.
+      Demo providers auto-reply to customer messages within 1.5–3.5s.
+      Curl E2E verified: customer sends message → provider auto-reply arrives → 2 unread notifications appear in feed.
+      FCM push notifications intentionally skipped per user instruction.

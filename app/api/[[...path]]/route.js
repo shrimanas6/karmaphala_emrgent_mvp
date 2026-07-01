@@ -317,6 +317,14 @@ async function handler(req) {
         createdAt: new Date(),
       };
       await db.collection('bookings').insertOne(booking);
+      // Notify provider
+      await db.collection('notifications').insertOne({
+        id: uuidv4(), userId: providerId, type: 'booking',
+        title: 'New booking request',
+        body: `${user.name || 'Someone'} requested ${booking.service}`,
+        meta: { bookingId: booking.id }, isRead: false,
+        createdAt: new Date(), createdAtMs: Date.now(),
+      });
       // Auto-accept demo providers after short delay simulation — return quickly; we'll auto accept on poll
       return json({ success: true, booking });
     }
@@ -344,6 +352,13 @@ async function handler(req) {
         if (provider?.isDemo && booking.status === 'pending' && (new Date() - new Date(booking.createdAt)) > 2000) {
           await db.collection('bookings').updateOne({ id: bid }, { $set: { status: 'accepted', acceptedAt: new Date() } });
           booking.status = 'accepted';
+          await db.collection('notifications').insertOne({
+            id: uuidv4(), userId: booking.customerId, type: 'booking',
+            title: `${booking.providerName} accepted your request`,
+            body: 'Your helper is on the way!',
+            meta: { bookingId: bid }, isRead: false,
+            createdAt: new Date(), createdAtMs: Date.now(),
+          });
         }
         const { _id, ...rest } = booking;
         return json({ booking: rest });
@@ -355,7 +370,14 @@ async function handler(req) {
       const bid = path.split('/')[1];
       const user = await getUserFromRequest(req);
       if (!user) return err('Unauthorized', 401);
+      const b = await db.collection('bookings').findOne({ id: bid });
       await db.collection('bookings').updateOne({ id: bid, providerId: user.id }, { $set: { status: 'accepted', acceptedAt: new Date() } });
+      if (b) await db.collection('notifications').insertOne({
+        id: uuidv4(), userId: b.customerId, type: 'booking',
+        title: `${user.name || 'Helper'} accepted your request`,
+        body: 'Your helper is on the way!', meta: { bookingId: bid },
+        isRead: false, createdAt: new Date(), createdAtMs: Date.now(),
+      });
       return json({ success: true });
     }
 
@@ -364,7 +386,14 @@ async function handler(req) {
       const bid = path.split('/')[1];
       const user = await getUserFromRequest(req);
       if (!user) return err('Unauthorized', 401);
+      const b = await db.collection('bookings').findOne({ id: bid });
       await db.collection('bookings').updateOne({ id: bid, providerId: user.id }, { $set: { status: 'rejected', rejectedAt: new Date() } });
+      if (b) await db.collection('notifications').insertOne({
+        id: uuidv4(), userId: b.customerId, type: 'booking',
+        title: `Request declined`,
+        body: 'Please try another helper nearby.', meta: { bookingId: bid },
+        isRead: false, createdAt: new Date(), createdAtMs: Date.now(),
+      });
       return json({ success: true });
     }
 
@@ -384,6 +413,10 @@ async function handler(req) {
       if (!booking) return err('Not found', 404);
       if (booking.startOtp !== otp) return err('Invalid OTP');
       await db.collection('bookings').updateOne({ id: bid }, { $set: { status: 'started', startedAt: new Date() } });
+      await db.collection('notifications').insertMany([
+        { id: uuidv4(), userId: booking.customerId, type: 'booking', title: 'Job started 🚀', body: `Work has begun with ${booking.providerName}`, meta: { bookingId: bid }, isRead: false, createdAt: new Date(), createdAtMs: Date.now() },
+        { id: uuidv4(), userId: booking.providerId, type: 'booking', title: 'Job started', body: `Started ${booking.service} with ${booking.customerName}`, meta: { bookingId: bid }, isRead: false, createdAt: new Date(), createdAtMs: Date.now() },
+      ]);
       return json({ success: true });
     }
 
@@ -413,6 +446,10 @@ async function handler(req) {
       await db.collection('users').updateOne({ id: booking.customerId }, { $inc: { 'profile.karmaPoints': kp } });
       await db.collection('users').updateOne({ id: booking.providerId }, { $inc: { 'profile.karmaPoints': kp, 'provider.completedJobs': 1 } });
       await db.collection('bookings').updateOne({ id: bid }, { $set: { karmaAwarded: true } });
+      await db.collection('notifications').insertMany([
+        { id: uuidv4(), userId: booking.customerId, type: 'karma', title: `Job completed! +25 Karma 🎉`, body: `Amount ₹${amount} · Rate ${booking.providerName}`, meta: { bookingId: bid }, isRead: false, createdAt: new Date(), createdAtMs: Date.now() },
+        { id: uuidv4(), userId: booking.providerId, type: 'karma', title: `Payment received ₹${amount}`, body: `+25 Karma earned`, meta: { bookingId: bid }, isRead: false, createdAt: new Date(), createdAtMs: Date.now() },
+      ]);
       return json({ success: true, amount, karmaAwarded: kp });
     }
 
@@ -421,6 +458,156 @@ async function handler(req) {
       const bid = path.split('/')[1];
       const { rating, review } = await req.json();
       await db.collection('bookings').updateOne({ id: bid }, { $set: { rating: Number(rating), review: review || '' } });
+      return json({ success: true });
+    }
+
+    // ================== CHAT ==================
+    // GET /api/bookings/:id/messages?since=<ms>
+    if (path.match(/^bookings\/[^/]+\/messages$/) && method === 'GET') {
+      const bid = path.split('/')[1];
+      const user = await getUserFromRequest(req);
+      if (!user) return err('Unauthorized', 401);
+      const url = new URL(req.url);
+      const since = parseInt(url.searchParams.get('since') || '0');
+      const q = { bookingId: bid };
+      if (since) q.createdAtMs = { $gt: since };
+      const msgs = await db.collection('messages').find(q).sort({ createdAtMs: 1 }).limit(200).toArray();
+      // Mark other-side messages as read
+      await db.collection('messages').updateMany(
+        { bookingId: bid, senderId: { $ne: user.id }, read: { $ne: true } },
+        { $set: { read: true } }
+      );
+      return json({ messages: msgs.map(({ _id, ...m }) => m) });
+    }
+
+    // POST /api/bookings/:id/messages  { text, type }
+    if (path.match(/^bookings\/[^/]+\/messages$/) && method === 'POST') {
+      const bid = path.split('/')[1];
+      const user = await getUserFromRequest(req);
+      if (!user) return err('Unauthorized', 401);
+      const { text, type } = await req.json();
+      if (!text || !text.trim()) return err('Empty message');
+      const booking = await db.collection('bookings').findOne({ id: bid });
+      if (!booking) return err('Booking not found', 404);
+      const now = Date.now();
+      // Determine sender role
+      const isCustomer = booking.customerId === user.id;
+      const isProvider = booking.providerId === user.id;
+      if (!isCustomer && !isProvider) return err('Not part of booking', 403);
+      const msg = {
+        id: uuidv4(),
+        bookingId: bid,
+        senderId: user.id,
+        senderName: user.name || 'User',
+        senderRole: isCustomer ? 'customer' : 'provider',
+        text: text.trim(),
+        type: type || 'text',
+        read: false,
+        createdAt: new Date(),
+        createdAtMs: now,
+      };
+      await db.collection('messages').insertOne(msg);
+
+      // If demo provider is receiving message, auto-reply after brief delay
+      const recipientId = isCustomer ? booking.providerId : booking.customerId;
+      const recipient = await db.collection('users').findOne({ id: recipientId });
+
+      // Create notification for recipient
+      await db.collection('notifications').insertOne({
+        id: uuidv4(),
+        userId: recipientId,
+        type: 'chat',
+        title: `New message from ${user.name || 'User'}`,
+        body: text.trim().slice(0, 80),
+        meta: { bookingId: bid },
+        isRead: false,
+        createdAt: new Date(),
+        createdAtMs: now,
+      });
+
+      // Auto-reply for demo provider
+      if (isCustomer && recipient?.isDemo) {
+        const replies = [
+          "Sure, I'll be there soon!",
+          "Got it, thank you 🙏",
+          "Understood. Please share the exact address.",
+          "On my way, ETA 10 minutes.",
+          "Thanks for the details!",
+        ];
+        const reply = replies[Math.floor(Math.random() * replies.length)];
+        setTimeout(async () => {
+          try {
+            const db2 = await getDb();
+            await db2.collection('messages').insertOne({
+              id: uuidv4(),
+              bookingId: bid,
+              senderId: recipient.id,
+              senderName: recipient.name,
+              senderRole: 'provider',
+              text: reply,
+              type: 'text',
+              read: false,
+              createdAt: new Date(),
+              createdAtMs: Date.now(),
+            });
+            await db2.collection('notifications').insertOne({
+              id: uuidv4(),
+              userId: booking.customerId,
+              type: 'chat',
+              title: `New message from ${recipient.name}`,
+              body: reply,
+              meta: { bookingId: bid },
+              isRead: false,
+              createdAt: new Date(),
+              createdAtMs: Date.now(),
+            });
+          } catch (e) { console.error('auto-reply err', e); }
+        }, 1500 + Math.random() * 2000);
+      }
+
+      const { _id, ...clean } = msg;
+      return json({ success: true, message: clean });
+    }
+
+    // GET /api/bookings/:id/messages/unread-count
+    if (path.match(/^bookings\/[^/]+\/messages\/unread-count$/) && method === 'GET') {
+      const bid = path.split('/')[1].split('/')[0];
+      const user = await getUserFromRequest(req);
+      if (!user) return err('Unauthorized', 401);
+      const count = await db.collection('messages').countDocuments({
+        bookingId: bid, senderId: { $ne: user.id }, read: { $ne: true }
+      });
+      return json({ count });
+    }
+
+    // ================== NOTIFICATIONS ==================
+    // GET /api/notifications
+    if (path === 'notifications' && method === 'GET') {
+      const user = await getUserFromRequest(req);
+      if (!user) return err('Unauthorized', 401);
+      const list = await db.collection('notifications')
+        .find({ userId: user.id })
+        .sort({ createdAtMs: -1 })
+        .limit(50)
+        .toArray();
+      const unread = await db.collection('notifications').countDocuments({ userId: user.id, isRead: false });
+      return json({ notifications: list.map(({ _id, ...n }) => n), unread });
+    }
+
+    // POST /api/notifications/read-all
+    if (path === 'notifications/read-all' && method === 'POST') {
+      const user = await getUserFromRequest(req);
+      if (!user) return err('Unauthorized', 401);
+      await db.collection('notifications').updateMany({ userId: user.id, isRead: false }, { $set: { isRead: true } });
+      return json({ success: true });
+    }
+
+    // POST /api/notifications/:id/read
+    if (path.match(/^notifications\/[^/]+\/read$/) && method === 'POST') {
+      const nid = path.split('/')[1];
+      const user = await getUserFromRequest(req);
+      if (!user) return err('Unauthorized', 401);
+      await db.collection('notifications').updateOne({ id: nid, userId: user.id }, { $set: { isRead: true } });
       return json({ success: true });
     }
 

@@ -1,13 +1,13 @@
 'use client';
 
-import { useEffect, useMemo, useState, useCallback } from 'react';
+import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Sparkles, Shield, Heart, ArrowRight, ArrowLeft, Phone, CheckCircle2, Search, MapPin, Star,
   Zap, ChefHat, Wrench, Hammer, PaintBucket, Cog, Car, Stethoscope, HeartPulse, BriefcaseMedical,
   Scale, Cpu, BookOpen, GraduationCap, Flame, Camera, Scissors, Trees, Baby, PawPrint,
   UserCheck, Laptop, Settings, Users, Award, Wallet, Bell, LogOut, Power, ToggleLeft, ToggleRight,
-  Loader2, Check, Clock, Navigation, Sprout, Leaf
+  Loader2, Check, Clock, Navigation, Sprout, Leaf, MessageCircle, Send, X, CheckCheck
 } from 'lucide-react';
 
 const ICONS = {
@@ -348,15 +348,166 @@ const CompleteProfile = ({ onDone }) => {
 };
 
 // ---------- Dashboard ----------
-const TopBar = ({ onLogout }) => (
+// ---------- Notification Bell + Dropdown ----------
+const NotificationBell = ({ goto }) => {
+  const [notifs, setNotifs] = useState([]);
+  const [unread, setUnread] = useState(0);
+  const [open, setOpen] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await api('notifications');
+      setNotifs(r.notifications || []);
+      setUnread(r.unread || 0);
+    } catch {}
+  }, []);
+
+  useEffect(() => { load(); const t = setInterval(load, 3000); return () => clearInterval(t); }, [load]);
+
+  const openNotif = async (n) => {
+    try { await api(`notifications/${n.id}/read`, { method: 'POST' }); } catch {}
+    setOpen(false);
+    if (n.meta?.bookingId) {
+      localStorage.setItem('kp_active_booking', n.meta.bookingId);
+      goto('tracking');
+    }
+    load();
+  };
+
+  const readAll = async () => { try { await api('notifications/read-all', { method: 'POST' }); load(); } catch {} };
+
+  return (
+    <div className="relative">
+      <button onClick={() => setOpen(o => !o)} className="w-10 h-10 rounded-full bg-teal-50 flex items-center justify-center hover:bg-teal-100 transition relative">
+        <Bell className="w-5 h-5 text-teal-600"/>
+        {unread > 0 && (
+          <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center px-1">
+            {unread > 9 ? '9+' : unread}
+          </span>
+        )}
+      </button>
+      {open && (
+        <>
+          <div onClick={() => setOpen(false)} className="fixed inset-0 z-40"/>
+          <div className="absolute right-0 mt-2 w-80 max-w-[calc(100vw-2rem)] card-premium p-0 z-50 overflow-hidden">
+            <div className="flex items-center justify-between p-3 border-b border-teal-500/10">
+              <div className="font-display font-bold text-teal-700">Notifications</div>
+              {unread > 0 && <button onClick={readAll} className="text-xs text-teal-600 font-semibold hover:underline">Mark all read</button>}
+            </div>
+            <div className="max-h-96 overflow-y-auto">
+              {notifs.length === 0 ? (
+                <div className="p-6 text-center text-sm text-teal-700/60">No notifications yet</div>
+              ) : notifs.map(n => (
+                <button key={n.id} onClick={() => openNotif(n)} className={`w-full text-left p-3 border-b border-teal-500/5 hover:bg-teal-50 transition flex gap-3 ${!n.isRead ? 'bg-gold-50/40' : ''}`}>
+                  <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${n.type === 'chat' ? 'bg-blue-100 text-blue-600' : n.type === 'karma' ? 'bg-gold-100 text-gold-500' : 'bg-teal-100 text-teal-600'}`}>
+                    {n.type === 'chat' ? <MessageCircle className="w-4 h-4"/> : n.type === 'karma' ? <Sparkles className="w-4 h-4"/> : <Bell className="w-4 h-4"/>}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-semibold text-teal-700 truncate">{n.title}</div>
+                    <div className="text-xs text-teal-700/60 truncate">{n.body}</div>
+                    <div className="text-[10px] text-teal-700/40 mt-0.5">{new Date(n.createdAt).toLocaleTimeString()}</div>
+                  </div>
+                  {!n.isRead && <div className="w-2 h-2 bg-gold-400 rounded-full shrink-0 mt-1"/>}
+                </button>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+// ---------- Chat Sheet ----------
+const ChatSheet = ({ bookingId, user, otherName, onClose }) => {
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState('');
+  const [sending, setSending] = useState(false);
+  const lastMs = useRef(0);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await api(`bookings/${bookingId}/messages`);
+      setMessages(r.messages || []);
+      if (r.messages?.length) lastMs.current = r.messages[r.messages.length - 1].createdAtMs;
+    } catch {}
+  }, [bookingId]);
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 1200);
+    return () => clearInterval(t);
+  }, [load]);
+
+  useEffect(() => {
+    const el = document.getElementById('chat-scroll');
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages]);
+
+  const send = async () => {
+    if (!text.trim() || sending) return;
+    setSending(true);
+    const t = text.trim();
+    setText('');
+    try {
+      await api(`bookings/${bookingId}/messages`, { method: 'POST', body: JSON.stringify({ text: t }) });
+      load();
+    } catch (e) { alert(e.message); }
+    setSending(false);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+      <div className="w-full sm:max-w-md bg-white rounded-t-3xl sm:rounded-3xl shadow-premium flex flex-col overflow-hidden" style={{ height: 'min(85vh, 640px)' }} onClick={e => e.stopPropagation()}>
+        <div className="p-4 border-b border-teal-500/10 flex items-center gap-3 bg-gradient-to-br from-teal-500 to-teal-600 text-white">
+          <AvatarCircle name={otherName} size={40} verified/>
+          <div className="flex-1 min-w-0">
+            <div className="font-bold truncate">{otherName}</div>
+            <div className="text-xs text-white/80 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-green-300"/> Online</div>
+          </div>
+          <button onClick={onClose} className="w-9 h-9 rounded-full bg-white/20 flex items-center justify-center hover:bg-white/30 transition"><X className="w-5 h-5"/></button>
+        </div>
+
+        <div id="chat-scroll" className="flex-1 overflow-y-auto p-4 space-y-2 bg-beige-100">
+          {messages.length === 0 && (
+            <div className="text-center text-sm text-teal-700/50 py-8">
+              <MessageCircle className="w-10 h-10 mx-auto mb-2 opacity-40"/>
+              Start a conversation
+            </div>
+          )}
+          {messages.map(m => {
+            const mine = m.senderId === user.id;
+            return (
+              <div key={m.id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
+                <div className={`max-w-[75%] px-3.5 py-2 rounded-2xl text-sm break-words ${mine ? 'bg-teal-500 text-white rounded-br-sm' : 'bg-white text-teal-800 rounded-bl-sm shadow-soft'}`}>
+                  <div>{m.text}</div>
+                  <div className={`text-[10px] mt-1 flex items-center gap-1 ${mine ? 'text-white/70 justify-end' : 'text-teal-700/40'}`}>
+                    {new Date(m.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    {mine && (m.read ? <CheckCheck className="w-3 h-3"/> : <Check className="w-3 h-3"/>)}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="p-3 border-t border-teal-500/10 bg-white flex gap-2">
+          <input value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === 'Enter' && send()} placeholder="Type a message..." className="input-field flex-1"/>
+          <button onClick={send} disabled={!text.trim() || sending} className="w-12 h-12 rounded-2xl bg-teal-500 text-white flex items-center justify-center hover:bg-teal-600 transition disabled:opacity-40">
+            {sending ? <Loader2 className="w-5 h-5 animate-spin"/> : <Send className="w-5 h-5"/>}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const TopBar = ({ onLogout, goto }) => (
   <div className="sticky top-0 z-30 bg-white/85 backdrop-blur-md border-b border-teal-500/10">
     <div className="container max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
       <KPLogo size="sm"/>
       <div className="flex items-center gap-3">
-        <button className="w-10 h-10 rounded-full bg-teal-50 flex items-center justify-center hover:bg-teal-100 transition relative">
-          <Bell className="w-5 h-5 text-teal-600"/>
-          <span className="absolute top-2 right-2 w-2 h-2 bg-red-500 rounded-full"/>
-        </button>
+        <NotificationBell goto={goto}/>
         <button onClick={onLogout} className="w-10 h-10 rounded-full bg-teal-50 flex items-center justify-center hover:bg-red-50 transition">
           <LogOut className="w-5 h-5 text-teal-600"/>
         </button>
@@ -571,7 +722,7 @@ const Dashboard = ({ user, setUser, onLogout, goto }) => {
   };
   return (
     <div className="min-h-screen bg-beige-100 pb-20">
-      <TopBar onLogout={onLogout}/>
+      <TopBar onLogout={onLogout} goto={goto}/>
       <div className="container max-w-5xl mx-auto px-4 pt-6">
         <div className="card-premium p-5 mb-6">
           <div className="flex items-center justify-between gap-4">
@@ -941,6 +1092,8 @@ const Tracking = ({ user, goto, onBack }) => {
   const [showRate, setShowRate] = useState(false);
   const [rating, setRating] = useState(5);
   const [review, setReview] = useState('');
+  const [chatOpen, setChatOpen] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
   const isProvider = user.profile?.mode === 'provider';
 
   const load = useCallback(async () => {
@@ -948,7 +1101,18 @@ const Tracking = ({ user, goto, onBack }) => {
     try { const res = await api(`bookings/${bookingId}`); setBooking(res.booking); } catch {}
   }, [bookingId]);
 
+  const loadUnread = useCallback(async () => {
+    if (!bookingId || chatOpen) return;
+    try {
+      const r = await api(`bookings/${bookingId}/messages`);
+      const cnt = (r.messages || []).filter(m => m.senderId !== user.id && !m.read).length;
+      setUnreadCount(cnt);
+    } catch {}
+  }, [bookingId, chatOpen, user.id]);
+
   useEffect(() => { load(); const t = setInterval(load, 2500); return () => clearInterval(t); }, [load]);
+  useEffect(() => { loadUnread(); const t = setInterval(loadUnread, 2000); return () => clearInterval(t); }, [loadUnread]);
+  useEffect(() => { if (chatOpen) setUnreadCount(0); }, [chatOpen]);
 
   if (!booking) return <div className="min-h-screen bg-beige-100 flex items-center justify-center"><Loader2 className="w-8 h-8 animate-spin text-teal-500"/></div>;
 
@@ -1014,9 +1178,19 @@ const Tracking = ({ user, goto, onBack }) => {
               <div className="font-bold text-teal-700">{otherName}</div>
               <div className="text-sm text-teal-700/60">{booking.service} · {booking.duration}</div>
             </div>
+            <button onClick={() => setChatOpen(true)} className="relative w-10 h-10 rounded-full bg-gold-400 flex items-center justify-center hover:scale-105 transition">
+              <MessageCircle className="w-4 h-4 text-white"/>
+              {unreadCount > 0 && (
+                <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center px-1">
+                  {unreadCount > 9 ? '9+' : unreadCount}
+                </span>
+              )}
+            </button>
             <a href="tel:+919999999999" className="w-10 h-10 rounded-full bg-teal-500 flex items-center justify-center hover:scale-105 transition"><Phone className="w-4 h-4 text-white"/></a>
           </div>
         </div>
+
+        {chatOpen && <ChatSheet bookingId={bookingId} user={user} otherName={otherName} onClose={() => setChatOpen(false)}/>}
 
         {booking.status === 'accepted' && (
           <div className="card-premium p-5">
