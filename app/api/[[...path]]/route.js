@@ -360,6 +360,12 @@ async function handler(req) {
             createdAt: new Date(), createdAtMs: Date.now(),
           });
         }
+        // Attach live provider location
+        if (provider?.provider?.location) {
+          booking.liveProviderLocation = provider.provider.location;
+          booking.liveProviderLocationUpdatedAt = provider.provider.locationUpdatedAt;
+          booking.providerIsOnline = provider.profile?.isOnline || false;
+        }
         const { _id, ...rest } = booking;
         return json({ booking: rest });
       }

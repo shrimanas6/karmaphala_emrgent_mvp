@@ -214,11 +214,21 @@ agent_communication:
       Fixed Next.js 15 hydration blank-screen (Framer Motion + allowedDevOrigins).
   - agent: "main"
     message: |
-      Feature addition: In-app real-time chat (polling 1.2s) + notification bell + feed.
-      Backend endpoints:
-        - GET/POST /api/bookings/:id/messages
-        - GET /api/notifications, POST /api/notifications/:id/read, POST /api/notifications/read-all
-      Auto notifications on: booking created, accepted, rejected, started, completed, karma award, new chat message.
-      Demo providers auto-reply to customer messages within 1.5–3.5s.
-      Curl E2E verified: customer sends message → provider auto-reply arrives → 2 unread notifications appear in feed.
-      FCM push notifications intentionally skipped per user instruction.
+      Feature: Real-time two-user testing flow.
+      Backend additions: booking GET now returns `liveProviderLocation` + `providerIsOnline` from provider's live doc.
+      Frontend additions:
+        - Browser Geolocation captured (with fallback to Green Park). Cached in localStorage 5 min.
+        - Provider mode auto-updates GPS every 15s while online + every 10s during an active job.
+        - Customer SearchScreen auto-polls every 3s → new online providers appear without refresh (with "NEW" chip animation on freshly-arrived ones).
+        - Live tracking map now uses actual lat/lng deltas of both parties; polls every 2.5s; shows "Live GPS" pulse chip if provider online, plus real distance and computed ETA.
+        - Big attention modal + beep sound + browser Notification for provider on new incoming booking request.
+        - "Test Mode" banner (with share-app-link copy button) on both Customer and Provider dashboards.
+        - Provider setup auto-verifies (already existed) → labeled clearly as Test Mode bypass of Aadhaar/admin approval.
+      Two-user curl simulation validated end-to-end:
+        - Alice registers → Bob registers → Bob (Electrician) goes online 200m away →
+          Bob appears #1 in Alice's search list (0.2km, ₹400/hr) →
+          Alice books Bob (Fan repair, ₹800) — stays PENDING (no auto-accept for real users) →
+          Bob gets pending request + notification →
+          Bob accepts → Alice's tracking gets liveProviderLocation + providerIsOnline=true →
+          Bob's GPS moves → chat both ways works →
+          Start OTP 6526 → job started → End OTP 4505 → job completed, +25 karma each.

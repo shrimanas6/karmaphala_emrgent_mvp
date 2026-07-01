@@ -31,6 +31,73 @@ const api = async (path, opts = {}) => {
   return data;
 };
 
+// ---------- Geolocation Helper ----------
+// Returns Promise<{lat, lng, source}> where source is 'gps' | 'cached' | 'default'
+const FALLBACK_LOC = { lat: 28.5589, lng: 77.2069 }; // Green Park, New Delhi
+const getGeo = (timeout = 8000) => new Promise((resolve) => {
+  if (typeof window === 'undefined' || !navigator.geolocation) {
+    return resolve({ ...FALLBACK_LOC, source: 'default' });
+  }
+  // Try cached first for instant response
+  try {
+    const cached = localStorage.getItem('kp_loc');
+    if (cached) {
+      const { lat, lng, at } = JSON.parse(cached);
+      if (Date.now() - at < 5 * 60 * 1000) {
+        // Kick off a refresh in background but return cached now
+        navigator.geolocation.getCurrentPosition(
+          (p) => {
+            const loc = { lat: p.coords.latitude, lng: p.coords.longitude, at: Date.now() };
+            localStorage.setItem('kp_loc', JSON.stringify(loc));
+          },
+          () => {},
+          { enableHighAccuracy: false, timeout: 5000, maximumAge: 60000 }
+        );
+        return resolve({ lat, lng, source: 'cached' });
+      }
+    }
+  } catch {}
+  navigator.geolocation.getCurrentPosition(
+    (p) => {
+      const loc = { lat: p.coords.latitude, lng: p.coords.longitude, at: Date.now() };
+      try { localStorage.setItem('kp_loc', JSON.stringify(loc)); } catch {}
+      resolve({ lat: loc.lat, lng: loc.lng, source: 'gps' });
+    },
+    () => resolve({ ...FALLBACK_LOC, source: 'default' }),
+    { enableHighAccuracy: true, timeout, maximumAge: 30000 }
+  );
+});
+
+// Play a short beep for attention (no external audio needed)
+const beep = () => {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'sine'; o.frequency.value = 880;
+    o.connect(g); g.connect(ctx.destination);
+    g.gain.setValueAtTime(0.15, ctx.currentTime);
+    o.start();
+    o.stop(ctx.currentTime + 0.18);
+    setTimeout(() => {
+      const o2 = ctx.createOscillator(); const g2 = ctx.createGain();
+      o2.type = 'sine'; o2.frequency.value = 1320;
+      o2.connect(g2); g2.connect(ctx.destination);
+      g2.gain.setValueAtTime(0.15, ctx.currentTime);
+      o2.start(); o2.stop(ctx.currentTime + 0.2);
+    }, 220);
+  } catch {}
+};
+
+// Copy to clipboard
+const copyLink = () => {
+  try {
+    const link = window.location.origin;
+    navigator.clipboard?.writeText(link);
+    return link;
+  } catch { return window.location.origin; }
+};
+
 const KPLogo = ({ size = 'md' }) => {
   const s = size === 'lg' ? 'text-3xl' : size === 'sm' ? 'text-lg' : 'text-2xl';
   const dot = size === 'lg' ? 'w-12 h-12' : size === 'sm' ? 'w-8 h-8' : 'w-10 h-10';
@@ -539,6 +606,31 @@ const StatCard = ({ label, value, icon: Icon, color }) => {
   );
 };
 
+const TestModeBanner = () => {
+  const [copied, setCopied] = useState(false);
+  const [link, setLink] = useState('');
+  useEffect(() => { setLink(typeof window !== 'undefined' ? window.location.origin : ''); }, []);
+  const doCopy = () => { copyLink(); setCopied(true); setTimeout(() => setCopied(false), 2000); };
+  return (
+    <div className="card-premium p-4 mb-4 bg-gradient-to-br from-gold-50 to-beige-100 border border-gold-200">
+      <div className="flex items-start gap-3">
+        <div className="w-10 h-10 rounded-xl bg-gold-100 text-gold-500 flex items-center justify-center shrink-0"><Sparkles className="w-5 h-5"/></div>
+        <div className="flex-1 min-w-0">
+          <div className="font-semibold text-teal-700 text-sm flex items-center gap-2">Test Mode <span className="chip chip-gold text-[10px] px-1.5 py-0">DEMO</span></div>
+          <div className="text-xs text-teal-700/70 mt-0.5 mb-2">Aadhaar & admin approval bypassed. Providers marked auto-verified so two devices can test the whole flow instantly.</div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <div className="flex-1 min-w-[180px] text-xs font-mono truncate p-2 rounded-lg bg-white border border-teal-500/10 text-teal-700">{link}</div>
+            <button onClick={doCopy} className="text-xs font-semibold px-3 py-2 rounded-lg bg-teal-500 text-white hover:bg-teal-600 transition whitespace-nowrap">
+              {copied ? 'Copied ✓' : 'Copy link'}
+            </button>
+          </div>
+          <div className="text-[11px] text-teal-700/60 mt-2">Share this link with a friend → they register on their phone → switch to Provider mode → go Online → you&apos;ll see them here in real time.</div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const CustomerDash = ({ goto }) => {
   const popularServices = [
     { name: 'Cook', icon: 'ChefHat', color: 'bg-orange-100 text-orange-600' },
@@ -552,6 +644,7 @@ const CustomerDash = ({ goto }) => {
   ];
   return (
     <>
+      <TestModeBanner/>
       <div className="card-premium p-5 mb-6 bg-gradient-to-br from-teal-500 to-teal-600 text-white">
         <div className="flex items-center justify-between gap-4">
           <div>
@@ -607,25 +700,70 @@ const ProviderDash = ({ user, setUser, goto }) => {
   const [online, setOnline] = useState(user.profile?.isOnline || false);
   const [incoming, setIncoming] = useState([]);
   const [myBookings, setMyBookings] = useState([]);
+  const [alertRequest, setAlertRequest] = useState(null);
+  const seenReqIds = useRef(new Set());
+  const [locStatus, setLocStatus] = useState('');
+
+  const pushLocation = useCallback(async () => {
+    try {
+      const loc = await getGeo();
+      await api('provider/location', { method: 'POST', body: JSON.stringify({ lat: loc.lat, lng: loc.lng }) });
+      setLocStatus(loc.source === 'gps' ? 'gps' : loc.source);
+    } catch {}
+  }, []);
 
   const toggleOnline = async () => {
     const newVal = !online;
     setOnline(newVal);
     try {
+      // Push location right before going online
+      if (newVal) await pushLocation();
       await api('provider/toggle-online', { method: 'POST', body: JSON.stringify({ online: newVal }) });
       setUser({ ...user, profile: { ...user.profile, isOnline: newVal }});
     } catch { setOnline(!newVal); }
   };
 
+  // Auto-update GPS location every 15s while online
+  useEffect(() => {
+    if (!online) return;
+    pushLocation();
+    const t = setInterval(pushLocation, 15000);
+    return () => clearInterval(t);
+  }, [online, pushLocation]);
+
   const loadBookings = useCallback(async () => {
     try {
       const res = await api('bookings/list?role=provider');
-      setIncoming(res.bookings.filter(b => b.status === 'pending'));
+      const pending = res.bookings.filter(b => b.status === 'pending');
+      // Detect new pending requests to trigger attention
+      pending.forEach(b => {
+        if (!seenReqIds.current.has(b.id)) {
+          seenReqIds.current.add(b.id);
+          // Only alert on real-time new arrivals (not on first load)
+          if (seenReqIds.current.size > 1 || incoming.length === 0) {
+            // fire attention if the booking is very fresh
+            if (Date.now() - new Date(b.createdAt).getTime() < 30000) {
+              setAlertRequest(b);
+              beep();
+              try { if ('Notification' in window && Notification.permission === 'granted') {
+                new Notification('New KarmaPhala request', { body: `${b.customerName} · ${b.service}` });
+              } } catch {}
+            }
+          }
+        }
+      });
+      setIncoming(pending);
       setMyBookings(res.bookings.filter(b => b.status !== 'pending'));
     } catch {}
-  }, []);
+  }, [incoming.length]);
 
-  useEffect(() => { loadBookings(); const t = setInterval(loadBookings, 4000); return () => clearInterval(t); }, [loadBookings]);
+  useEffect(() => {
+    // Ask for notification permission once
+    try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch {}
+    loadBookings();
+    const t = setInterval(loadBookings, 3000);
+    return () => clearInterval(t);
+  }, [loadBookings]);
 
   const totalEarnings = myBookings.filter(b => b.status === 'completed').reduce((s, b) => s + (b.amount || 0), 0);
   const activeJob = myBookings.find(b => ['accepted','started'].includes(b.status));
@@ -636,18 +774,43 @@ const ProviderDash = ({ user, setUser, goto }) => {
 
   return (
     <>
+      <TestModeBanner/>
       <div className={`card-premium p-5 mb-6 ${online ? 'bg-gradient-to-br from-green-500 to-emerald-600 text-white' : 'bg-white'}`}>
         <div className="flex items-center justify-between">
           <div>
             <div className={`text-sm ${online ? 'text-white/80' : 'text-teal-700/60'}`}>You are</div>
             <div className={`text-2xl font-display font-bold ${online ? 'text-white' : 'text-teal-700'}`}>{online ? 'ONLINE' : 'OFFLINE'}</div>
-            <div className={`text-xs mt-1 ${online ? 'text-white/70' : 'text-teal-700/60'}`}>{online ? 'Visible to customers nearby' : 'Turn on to receive requests'}</div>
+            <div className={`text-xs mt-1 ${online ? 'text-white/70' : 'text-teal-700/60'}`}>{online ? `Visible nearby · ${locStatus === 'gps' ? 'Live GPS' : locStatus === 'cached' ? 'GPS cached' : 'Default location'}` : 'Turn on to receive requests'}</div>
           </div>
           <button onClick={toggleOnline} className={`w-16 h-16 rounded-full flex items-center justify-center shadow-premium transition ${online ? 'bg-white' : 'bg-teal-500'}`}>
             <Power className={`w-7 h-7 ${online ? 'text-green-500' : 'text-white'}`}/>
           </button>
         </div>
       </div>
+
+      {/* Big attention alert modal for a new incoming request */}
+      {alertRequest && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in" onClick={() => setAlertRequest(null)}>
+          <div className="w-full max-w-md card-premium p-6 relative" onClick={e => e.stopPropagation()}>
+            <div className="absolute -top-4 left-1/2 -translate-x-1/2 chip chip-gold animate-pulse text-sm px-4 py-1">🔔 NEW REQUEST</div>
+            <div className="flex items-center gap-3 mb-4 mt-2">
+              <AvatarCircle name={alertRequest.customerName} size={56}/>
+              <div className="flex-1">
+                <div className="font-bold text-teal-700 text-lg">{alertRequest.customerName}</div>
+                <div className="text-sm text-teal-700/70">{alertRequest.service} · {alertRequest.duration}</div>
+              </div>
+              <div className="text-right">
+                <div className="text-2xl font-bold text-gold-500">₹{alertRequest.pricePerHour * (parseInt(alertRequest.duration)||2)}</div>
+              </div>
+            </div>
+            {alertRequest.notes && <div className="p-3 rounded-xl bg-teal-50 text-sm text-teal-700 mb-4 italic">&quot;{alertRequest.notes}&quot;</div>}
+            <div className="grid grid-cols-2 gap-3">
+              <button onClick={() => { handleAction(alertRequest.id, 'reject'); setAlertRequest(null); }} className="py-3 rounded-2xl bg-red-50 text-red-600 font-bold hover:bg-red-100 transition">Reject</button>
+              <button onClick={() => { handleAction(alertRequest.id, 'accept'); setAlertRequest(null); }} className="py-3 rounded-2xl bg-teal-500 text-white font-bold hover:bg-teal-600 transition">Accept</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-3 gap-3 mb-6">
         <StatCard label="Today" value={`₹${totalEarnings}`} icon={Wallet} color="gold"/>
@@ -759,12 +922,23 @@ const ProviderSetup = ({ setUser, onDone, onBack }) => {
     location: { lat: 28.5589, lng: 77.2069 }
   });
   const [loading, setLoading] = useState(false);
-  useEffect(() => { api('meta').then(setMeta); }, []);
+  useEffect(() => {
+    api('meta').then(setMeta);
+    // Capture real location
+    getGeo().then(loc => setForm(f => ({ ...f, location: { lat: loc.lat, lng: loc.lng }, _locSource: loc.source })));
+  }, []);
   const toggleSkill = (s) => setForm(f => ({ ...f, additionalSkills: f.additionalSkills.includes(s) ? f.additionalSkills.filter(x => x !== s) : [...f.additionalSkills, s] }));
   const toggleLang = (l) => setForm(f => ({ ...f, languages: f.languages.includes(l) ? f.languages.filter(x => x !== l) : [...f.languages, l] }));
   const submit = async () => {
     setLoading(true);
-    try { const res = await api('provider/setup', { method: 'POST', body: JSON.stringify(form) }); setUser(res.user); onDone(); }
+    try {
+      // Refresh location right before submit
+      const loc = await getGeo();
+      const payload = { ...form, location: { lat: loc.lat, lng: loc.lng } };
+      const res = await api('provider/setup', { method: 'POST', body: JSON.stringify(payload) });
+      setUser(res.user);
+      onDone();
+    }
     catch(e) { alert(e.message); }
     setLoading(false);
   };
@@ -887,13 +1061,13 @@ const ProviderSetup = ({ setUser, onDone, onBack }) => {
 
 // ---------- Search ----------
 const ProviderCard = ({ p, onSelect }) => (
-  <div onClick={onSelect} className="card-premium p-4 mb-3 cursor-pointer hover:-translate-y-0.5 transition-transform">
+  <div onClick={onSelect} className={`card-premium p-4 mb-3 cursor-pointer hover:-translate-y-0.5 transition-transform ${p.isNew ? 'ring-2 ring-gold-400 animate-fade-in' : ''}`}>
     <div className="flex gap-3">
       <AvatarCircle name={p.name} size={56} verified={p.isVerified}/>
       <div className="flex-1 min-w-0">
         <div className="flex items-start justify-between gap-2">
           <div>
-            <div className="font-bold text-teal-700 truncate">{p.name}</div>
+            <div className="font-bold text-teal-700 truncate flex items-center gap-2">{p.name}{p.isNew && <span className="chip chip-gold text-[10px] px-1.5 py-0">NEW</span>}</div>
             <div className="text-sm text-teal-700/70">{p.profession} · <span className="text-gold-500 font-semibold">{p.level}</span></div>
           </div>
           <div className="text-right shrink-0">
@@ -917,26 +1091,43 @@ const SearchScreen = ({ goto, onBack }) => {
   const [radius, setRadius] = useState(5);
   const [gender, setGender] = useState('Any');
   const [results, setResults] = useState([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [meta, setMeta] = useState({ professions: [] });
   const [showFemaleAsk, setShowFemaleAsk] = useState(false);
+  const [myLoc, setMyLoc] = useState(null);
+  const [locSource, setLocSource] = useState('');
 
-  useEffect(() => { api('meta').then(setMeta); if (typeof window !== 'undefined') localStorage.removeItem('kp_profession'); }, []);
+  useEffect(() => {
+    api('meta').then(setMeta);
+    if (typeof window !== 'undefined') localStorage.removeItem('kp_profession');
+    getGeo().then(loc => { setMyLoc({ lat: loc.lat, lng: loc.lng }); setLocSource(loc.source); });
+  }, []);
 
   const search = useCallback(async () => {
-    setLoading(true);
+    if (!myLoc) return;
     try {
-      const params = new URLSearchParams({ lat: '28.5589', lng: '77.2069', radius: String(radius) });
+      const params = new URLSearchParams({ lat: String(myLoc.lat), lng: String(myLoc.lng), radius: String(radius) });
       if (profession !== 'All') params.set('profession', profession);
       if (gender !== 'Any') params.set('gender', gender);
       const res = await api(`providers/search?${params}`);
-      setResults(res.results);
+      setResults(prev => {
+        // Detect newly appearing providers (by id) to flash them
+        const oldIds = new Set(prev.map(p => p.id));
+        return res.results.map(p => ({ ...p, isNew: !oldIds.has(p.id) && prev.length > 0 }));
+      });
       if (gender === 'Female' && res.results.length === 0) setShowFemaleAsk(true);
+      else setShowFemaleAsk(false);
     } catch(e) { console.error(e); }
     setLoading(false);
-  }, [profession, radius, gender]);
+  }, [profession, radius, gender, myLoc]);
 
-  useEffect(() => { search(); }, [search]);
+  // Auto-poll every 3 seconds so new online providers appear without refresh
+  useEffect(() => {
+    if (!myLoc) return;
+    search();
+    const t = setInterval(search, 3000);
+    return () => clearInterval(t);
+  }, [search, myLoc]);
 
   return (
     <div className="min-h-screen bg-beige-100 pb-8">
@@ -944,8 +1135,8 @@ const SearchScreen = ({ goto, onBack }) => {
         <div className="container max-w-3xl mx-auto px-4 py-4 flex items-center gap-3">
           <button onClick={onBack} className="w-10 h-10 rounded-full bg-teal-50 flex items-center justify-center"><ArrowLeft className="w-5 h-5 text-teal-700"/></button>
           <div className="flex-1">
-            <div className="text-xs text-teal-700/60">Searching near</div>
-            <div className="font-semibold text-teal-700 flex items-center gap-1"><MapPin className="w-3.5 h-3.5"/> Green Park, New Delhi</div>
+            <div className="text-xs text-teal-700/60 flex items-center gap-1">Searching near {locSource === 'gps' && <span className="chip chip-green text-[10px] px-1.5 py-0"><span className="w-1 h-1 bg-green-500 rounded-full inline-block"/> Live GPS</span>}{locSource === 'default' && <span className="chip text-[10px] px-1.5 py-0">Default</span>}</div>
+            <div className="font-semibold text-teal-700 flex items-center gap-1"><MapPin className="w-3.5 h-3.5"/> {myLoc ? `${myLoc.lat.toFixed(4)}, ${myLoc.lng.toFixed(4)}` : 'Locating...'}</div>
           </div>
         </div>
       </div>
@@ -1005,9 +1196,10 @@ const ProviderDetail = ({ goto, onBack }) => {
   const book = async () => {
     setCreating(true);
     try {
+      const loc = await getGeo();
       const res = await api('bookings/create', { method: 'POST', body: JSON.stringify({
         providerId: p.id, service: p.profession, notes, duration,
-        customerLocation: { lat: 28.5589, lng: 77.2069 }
+        customerLocation: { lat: loc.lat, lng: loc.lng }
       })});
       localStorage.setItem('kp_active_booking', res.booking.id);
       goto('tracking');
@@ -1114,6 +1306,22 @@ const Tracking = ({ user, goto, onBack }) => {
   useEffect(() => { loadUnread(); const t = setInterval(loadUnread, 2000); return () => clearInterval(t); }, [loadUnread]);
   useEffect(() => { if (chatOpen) setUnreadCount(0); }, [chatOpen]);
 
+  // If we're the provider on an active job, keep pushing our GPS location every 10s
+  useEffect(() => {
+    if (!isProvider) return;
+    if (!booking || !['accepted', 'started'].includes(booking.status)) return;
+    let cancelled = false;
+    const push = async () => {
+      try {
+        const loc = await getGeo();
+        if (!cancelled) await api('provider/location', { method: 'POST', body: JSON.stringify({ lat: loc.lat, lng: loc.lng }) });
+      } catch {}
+    };
+    push();
+    const t = setInterval(push, 10000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [isProvider, booking?.status]);
+
   if (!booking) return <div className="min-h-screen bg-beige-100 flex items-center justify-center"><Loader2 className="w-8 h-8 animate-spin text-teal-500"/></div>;
 
   const generateStart = async () => { const r = await api(`bookings/${bookingId}/start-otp`, { method: 'POST' }); setStartOtp(r.otp); };
@@ -1146,29 +1354,60 @@ const Tracking = ({ user, goto, onBack }) => {
       </div>
 
       <div className="container max-w-2xl mx-auto px-4 pt-4">
-        <div className="card-premium p-0 mb-4 overflow-hidden relative h-52 bg-gradient-to-br from-teal-100 via-softgreen-light to-teal-50">
+        <div className="card-premium p-0 mb-4 overflow-hidden relative h-56 bg-gradient-to-br from-teal-100 via-softgreen-light to-teal-50">
           <div className="absolute inset-0 opacity-40" style={{backgroundImage: 'radial-gradient(circle at 30% 40%, rgba(0,93,99,0.15) 0, transparent 50%), radial-gradient(circle at 70% 60%, rgba(217,154,34,0.15) 0, transparent 50%)'}}/>
-          <svg className="absolute inset-0 w-full h-full" viewBox="0 0 400 200" preserveAspectRatio="none">
-            <path d="M 50 150 Q 150 100 200 100 T 350 50" stroke="#005D63" strokeWidth="3" fill="none" strokeDasharray="6 4" opacity="0.5"/>
+          {/* Fake grid to feel map-like */}
+          <svg className="absolute inset-0 w-full h-full opacity-30" viewBox="0 0 400 224" preserveAspectRatio="none">
+            {[0,50,100,150,200,250,300,350,400].map(x => <line key={'v'+x} x1={x} y1="0" x2={x} y2="224" stroke="#005D63" strokeWidth="0.5"/>)}
+            {[0,40,80,120,160,200].map(y => <line key={'h'+y} x1="0" y1={y} x2="400" y2={y} stroke="#005D63" strokeWidth="0.5"/>)}
           </svg>
-          <div className="absolute left-8 top-1/2 -translate-y-1/2">
-            <div className="relative">
-              <div className="absolute inset-0 w-8 h-8 rounded-full bg-teal-500 animate-pulse-ring"/>
-              <div className="w-8 h-8 rounded-full bg-teal-500 flex items-center justify-center relative"><Heart className="w-4 h-4 text-white"/></div>
-            </div>
-            <div className="text-xs font-bold text-teal-700 mt-1">You</div>
-          </div>
-          <div className="absolute right-8 top-1/3">
-            <div className="w-10 h-10 rounded-full bg-gold-400 flex items-center justify-center border-4 border-white shadow-lg"><Navigation className="w-4 h-4 text-white"/></div>
-            <div className="text-xs font-bold text-gold-600 mt-1 text-right">{otherName?.split(' ')[0]}</div>
-          </div>
-          <div className="absolute bottom-3 left-3 right-3 bg-white/95 backdrop-blur rounded-xl p-2.5 flex items-center justify-between shadow-soft">
-            <div className="text-xs">
-              <div className="text-teal-700/60">Status</div>
-              <div className="font-bold text-teal-700">{statusLabel}</div>
-            </div>
-            {booking.status === 'accepted' && <div className="text-right text-xs"><div className="text-teal-700/60">ETA</div><div className="font-bold text-gold-500">~8 min</div></div>}
-          </div>
+          {(() => {
+            // Positions on the fake map: customer at center, provider offset by lat/lng delta
+            const cLoc = booking.customerLocation || FALLBACK_LOC;
+            const pLoc = booking.liveProviderLocation || booking.providerLocation || FALLBACK_LOC;
+            const dLat = pLoc.lat - cLoc.lat;
+            const dLng = pLoc.lng - cLoc.lng;
+            // Scale: 0.02 deg = ~edge of map
+            const scale = 0.02;
+            const clamp = v => Math.max(-1, Math.min(1, v / scale));
+            const px = 50 + clamp(dLng) * 40; // percentage
+            const py = 50 - clamp(dLat) * 40;
+            const isProvider = user.profile?.mode === 'provider';
+            const myPos = isProvider ? { x: px, y: py } : { x: 50, y: 50 };
+            const otherPos = isProvider ? { x: 50, y: 50 } : { x: px, y: py };
+            const km = Math.round(Math.sqrt(dLat*dLat*111*111 + dLng*dLng*111*111) * 10) / 10;
+            const eta = Math.max(2, Math.round(km * 6));
+            return (
+              <>
+                {/* Route line */}
+                <svg className="absolute inset-0 w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="none">
+                  <line x1={myPos.x} y1={myPos.y} x2={otherPos.x} y2={otherPos.y} stroke="#005D63" strokeWidth="0.6" strokeDasharray="2 1.5" opacity="0.5"/>
+                </svg>
+                {/* My marker */}
+                <div className="absolute -translate-x-1/2 -translate-y-1/2" style={{ left: `${myPos.x}%`, top: `${myPos.y}%` }}>
+                  <div className="relative">
+                    <div className="absolute inset-0 w-9 h-9 rounded-full bg-teal-500 animate-pulse-ring"/>
+                    <div className="w-9 h-9 rounded-full bg-teal-500 flex items-center justify-center relative border-2 border-white shadow-lg"><Heart className="w-4 h-4 text-white"/></div>
+                  </div>
+                  <div className="text-[10px] font-bold text-teal-700 mt-0.5 text-center">You</div>
+                </div>
+                {/* Other user marker */}
+                <div className="absolute -translate-x-1/2 -translate-y-1/2" style={{ left: `${otherPos.x}%`, top: `${otherPos.y}%` }}>
+                  <div className="w-10 h-10 rounded-full bg-gold-400 flex items-center justify-center border-4 border-white shadow-lg"><Navigation className="w-4 h-4 text-white"/></div>
+                  <div className="text-[10px] font-bold text-gold-600 mt-0.5 text-center max-w-[80px] truncate">{otherName?.split(' ')[0]}</div>
+                </div>
+                <div className="absolute top-2 left-2 chip text-[10px] bg-white/90 shadow-soft"><span className={`w-1.5 h-1.5 rounded-full inline-block mr-1 ${booking.providerIsOnline ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`}/>{booking.providerIsOnline ? 'Live GPS' : 'Provider offline'}</div>
+                <div className="absolute top-2 right-2 chip text-[10px] bg-white/90 shadow-soft">{km} km</div>
+                <div className="absolute bottom-3 left-3 right-3 bg-white/95 backdrop-blur rounded-xl p-2.5 flex items-center justify-between shadow-soft">
+                  <div className="text-xs">
+                    <div className="text-teal-700/60">Status</div>
+                    <div className="font-bold text-teal-700">{statusLabel}</div>
+                  </div>
+                  {['accepted','started'].includes(booking.status) && <div className="text-right text-xs"><div className="text-teal-700/60">ETA</div><div className="font-bold text-gold-500">~{eta} min</div></div>}
+                </div>
+              </>
+            );
+          })()}
         </div>
 
         <div className="card-premium p-4 mb-4">
